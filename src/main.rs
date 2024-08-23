@@ -1,4 +1,4 @@
-mod byte_packet_buffer;
+mod structure;
 
 fn main() {
     println!("Hello, world");

@@ -37,6 +37,11 @@ impl BytePacketBuffer {
         Ok(byte)
     }
 
+    fn read_u16(&mut self) -> Result<u16> {
+        let res = ((self.read()? as u16) << 8) | (self.read()? as u16); // read 2 bytes and put it into one u16
+        Ok(res)
+    }
+
     fn get(&mut self, pos: usize) -> Result<u8> {
         if pos >= 512 {
             return Err("End of buffer".into());
@@ -126,3 +131,114 @@ impl BytePacketBuffer {
         Ok(out)
     }
 }
+
+/// only implementing a few common result codes, the entire list is here
+/// https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-6
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResultCode{
+    NOERROR = 0,
+    FORMERR = 1,
+    SERVFAIL = 2,
+    NXDOMAIN = 3,
+    NOTIMP = 4,
+    REFUSED = 5,
+    YXDOMAIN = 6,
+    XRRSET = 7,
+    NOTAUTH = 8,
+    NOTZONE = 9
+}
+
+impl ResultCode {
+    pub fn from_num(n: u8) -> Self {
+        match n {
+            1 => ResultCode::FORMERR,
+            2 => ResultCode::SERVFAIL,
+            3 => ResultCode::NXDOMAIN,
+            4 => ResultCode::NOTIMP,
+            5 => ResultCode::REFUSED,
+            6 => ResultCode::YXDOMAIN,
+            7 => ResultCode::XRRSET,
+            8 => ResultCode::NOTAUTH,
+            9 => ResultCode::NOTZONE,
+            _ => ResultCode::NOERROR,
+        }
+    }
+}
+
+// header structure
+// 86 2a 01 20 00 01 00 00 00 00 00 00
+// in this example, 86 2a are the 16-bit ids
+// 01 20 represent the flags from query_res to rcode
+// 00 01, 00 00, 00 00, 00 00 represent the u16 counts
+struct Header{
+    pub id: u16, // 16 bit uid
+    pub query_res: bool,
+    pub opcode: u8, // 4 bits but we can use the low nibble
+    pub auth_ans: bool,
+    pub trunc_msg: bool,
+    pub rec_des: bool,
+    pub rec_ava: bool,
+    pub z: u8, // 3 bits fsr
+    pub rcode: ResultCode,
+    pub qdcount: u16,
+    pub anscount: u16,
+    pub nscount: u16,
+    pub arcount: u16
+}
+
+impl Header{
+    pub fn new() -> Self{
+        Self{
+            id: 0,
+            query_res: false,
+            opcode: 0,
+            auth_ans: false,
+            trunc_msg: false,
+            rec_des: false,
+            rec_ava: false,
+            z: 0,
+            rcode: ResultCode::NOERROR,
+            qdcount: 0,
+            anscount: 0,
+            nscount: 0,
+            arcount: 0
+
+        }
+    }
+    pub fn read(&mut self, buf: &mut BytePacketBuffer) -> Result<()>{
+        self.id = buf.read_u16()?;
+
+        // 0 0 0 0 0 0 0 1  0 0 1 0 0 0 0 0
+        // - -+-+-+- - - -  - -+-+- -+-+-+-
+        // Q    O    A T R  R   Z      R
+        // R    P    A C D  A          C
+        //      C                      O
+        //      O                      D
+        //      D                      E
+        //      E
+        let a = buf.read()?;
+        let b = buf.read()?;
+
+        // im using a mask to get only the required bits ,and then I shift it to right most side.
+        self.query_res = ((a & 0x80) >> 7) > 0;
+        self.opcode = (a & 0x78) >> 3;
+        self.auth_ans = ((a & 0x4) >> 2) > 0;
+        self.trunc_msg = ((a & 0x2) >> 1) > 0;
+        self.rec_des = (a & 0x1) > 0;
+
+        self.rec_ava = ((b & 0x80) >> 7) > 0;
+        self.z = (b & 0x70) >> 4;
+        self.rcode = ResultCode::from_num(b & 0xF);
+
+        self.qdcount = buf.read_u16()?;
+        self.anscount = buf.read_u16()?;
+        self.nscount = buf.read_u16()?;
+        self.arcount = buf.read_u16()?;
+
+        Ok(())
+    }
+}
+
+
+
