@@ -1,4 +1,7 @@
-use anyhow::Result;
+#![allow(clippy::upper_case_acronyms)]
+use crate::structure::QueryType::{A, UNKNOWN};
+use anyhow::{bail, Result};
+
 
 // this will represent our entire query
 pub struct BytePacketBuffer {
@@ -17,11 +20,6 @@ impl BytePacketBuffer {
         self.pos
     }
 
-    fn step(&mut self, step: usize) -> Result<()> {
-        self.pos += step;
-        Ok(())
-    }
-
     fn seek(&mut self, pos: usize) -> Result<()> {
         self.pos = pos;
         Ok(())
@@ -29,7 +27,7 @@ impl BytePacketBuffer {
 
     fn read(&mut self) -> Result<u8> {
         if self.pos >= 512 {
-            return Err("End of buffer".into());
+            bail!("End of buffer")
         }
         let byte = self.buf[self.pos];
         self.pos += 1;
@@ -44,7 +42,7 @@ impl BytePacketBuffer {
 
     fn get(&mut self, pos: usize) -> Result<u8> {
         if pos >= 512 {
-            return Err("End of buffer".into());
+            bail!("End of buffer");
         }
 
         Ok(self.buf[pos])
@@ -53,7 +51,7 @@ impl BytePacketBuffer {
     // read a range of bytes as mentioned by the length preceding a part of the qname
     fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8]> {
         if start + len >= 512 {
-            return Err("End of buffer".into());
+            bail!("End of buffer");
         }
         Ok(&self.buf[start..(start + len)])
     }
@@ -72,7 +70,7 @@ impl BytePacketBuffer {
         loop {
             // to prevent a infinite jump loop
             if jumps_performed > max_jumps {
-                return Err("max jumps exceeded".into());
+                bail!("max jumps exceeded");
             }
 
             let len = self.get(pos)?;
@@ -136,7 +134,7 @@ impl BytePacketBuffer {
 /// https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-6
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ResultCode{
+pub enum ResultCode {
     NOERROR = 0,
     FORMERR = 1,
     SERVFAIL = 2,
@@ -146,7 +144,7 @@ pub enum ResultCode{
     YXDOMAIN = 6,
     XRRSET = 7,
     NOTAUTH = 8,
-    NOTZONE = 9
+    NOTZONE = 9,
 }
 
 impl ResultCode {
@@ -171,7 +169,8 @@ impl ResultCode {
 // in this example, 86 2a are the 16-bit ids
 // 01 20 represent the flags from query_res to rcode
 // 00 01, 00 00, 00 00, 00 00 represent the u16 counts
-struct Header{
+#[derive(Clone, Debug)]
+pub struct DnsHeader {
     pub id: u16, // 16 bit uid
     pub query_res: bool,
     pub opcode: u8, // 4 bits but we can use the low nibble
@@ -184,12 +183,12 @@ struct Header{
     pub qdcount: u16,
     pub anscount: u16,
     pub nscount: u16,
-    pub arcount: u16
+    pub arcount: u16,
 }
 
-impl Header{
-    pub fn new() -> Self{
-        Self{
+impl DnsHeader {
+    pub fn new() -> Self {
+        Self {
             id: 0,
             query_res: false,
             opcode: 0,
@@ -202,11 +201,10 @@ impl Header{
             qdcount: 0,
             anscount: 0,
             nscount: 0,
-            arcount: 0
-
+            arcount: 0,
         }
     }
-    pub fn read(&mut self, buf: &mut BytePacketBuffer) -> Result<()>{
+    pub fn read(&mut self, buf: &mut BytePacketBuffer) -> Result<()> {
         self.id = buf.read_u16()?;
 
         // 0 0 0 0 0 0 0 1  0 0 1 0 0 0 0 0
@@ -240,5 +238,132 @@ impl Header{
     }
 }
 
+#[derive(PartialEq, Eq, Debug, Clone, Hash, Copy)]
+pub enum QueryType {
+    UNKNOWN(u16),
+    A,
+}
 
+impl QueryType {
+    fn from_num(num: u16) -> QueryType {
+        match num {
+            1 => A,
+            _ => UNKNOWN(num),
+        }
+    }
+}
 
+#[derive(PartialEq, Eq, Debug, Clone, Hash)]
+pub struct DnsQuestion {
+    pub name: String,
+    pub qtype: QueryType,
+    pub class: u16,
+}
+
+impl DnsQuestion {
+    pub fn new() -> Self {
+        Self {
+            name: String::new(),
+            qtype: QueryType::UNKNOWN(0),
+            class: 1,
+        }
+    }
+
+    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.name = buffer.read_qname()?;
+        self.qtype = QueryType::from_num(buffer.read_u16()?);
+        self.class = buffer.read_u16()?; // class, usually always 1
+
+        Ok(())
+    }
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Hash)]
+pub enum DnsRecord {
+    UNKNOWN {
+        domain: String,
+        qtype: QueryType,
+        class: u16,
+        ttl: u32,
+        len: u16,
+    },
+    A {
+        domain: String,
+        class: u16,
+        ttl: u32,
+        len: u16,
+        ip: u32,
+    },
+}
+
+impl DnsRecord {
+    pub fn from(buf: &mut BytePacketBuffer) -> Result<Self> {
+        let domain = buf.read_qname()?;
+
+        let qtype = QueryType::from_num(buf.read_u16()?);
+        let class = buf.read_u16()?;
+        let ttl = (buf.read_u16()? << 8) as u32 | buf.read_u16()? as u32;
+        let len = buf.read_u16()?;
+
+        match qtype {
+            QueryType::A => Ok(DnsRecord::A {
+                domain,
+                class,
+                ttl,
+                len,
+                ip: (buf.read_u16()? as u32) << 16 | buf.read_u16()? as u32,
+            }),
+            _ => Ok(DnsRecord::UNKNOWN {
+                domain,
+                qtype,
+                class,
+                ttl,
+                len,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DnsPacket {
+    pub header: DnsHeader,
+    pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsRecord>,
+    pub authorities: Vec<DnsRecord>,
+    pub additional: Vec<DnsRecord>,
+}
+
+impl DnsPacket {
+    fn new() -> Self {
+        Self {
+            header: DnsHeader::new(),
+            questions: vec![],
+            answers: vec![],
+            authorities: vec![],
+            additional: vec![],
+        }
+    }
+
+    pub fn from_buf(buf: &mut BytePacketBuffer) -> Result<Self> {
+        let mut res = DnsPacket::new();
+        res.header.read(buf)?;
+
+        for _ in 0..res.header.qdcount {
+            let mut qn = DnsQuestion::new();
+            qn.read(buf)?;
+            res.questions.push(qn)
+        }
+
+        for _ in 0..res.header.anscount {
+            res.answers.push(DnsRecord::from(buf)?)
+        }
+        for _ in 0..res.header.nscount {
+            res.answers.push(DnsRecord::from(buf)?)
+        }
+        for _ in 0..res.header.arcount {
+            res.answers.push(DnsRecord::from(buf)?)
+        }
+
+        Ok(res)
+    }
+}
