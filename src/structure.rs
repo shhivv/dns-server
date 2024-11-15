@@ -1,7 +1,5 @@
 #![allow(clippy::upper_case_acronyms)]
-use crate::structure::QueryType::{A, UNKNOWN};
 use anyhow::{bail, Result};
-
 
 // this will represent our entire query
 pub struct BytePacketBuffer {
@@ -16,7 +14,7 @@ impl BytePacketBuffer {
         }
     }
 
-    fn pos(&self) -> usize {
+    pub fn pos(&self) -> usize {
         self.pos
     }
 
@@ -35,6 +33,30 @@ impl BytePacketBuffer {
         Ok(byte)
     }
 
+    fn write(&mut self, val: u8) -> Result<()> {
+        if self.pos >= 512 {
+            bail!("End of buffer")
+        }
+        self.buf[self.pos] = val;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn write_u16(&mut self, val: u16) -> Result<()> {
+        self.write((val >> 8) as u8)?; // high byte
+        self.write((val & 0xFF) as u8)?; // low byte
+        Ok(())
+    }
+
+    fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write(((val >> 24) & 0xFF) as u8)?;
+        self.write(((val >> 16) & 0xFF) as u8)?;
+        self.write(((val >> 8) & 0xFF) as u8)?;
+        self.write(((val >> 0) & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
     fn read_u16(&mut self) -> Result<u16> {
         let res = ((self.read()? as u16) << 8) | (self.read()? as u16); // read 2 bytes and put it into one u16
         Ok(res)
@@ -49,11 +71,18 @@ impl BytePacketBuffer {
     }
 
     // read a range of bytes as mentioned by the length preceding a part of the qname
-    fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8]> {
+    pub fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8]> {
         if start + len >= 512 {
             bail!("End of buffer");
         }
         Ok(&self.buf[start..(start + len)])
+    }
+
+
+    fn step(&mut self, steps: usize) -> Result<()> {
+        self.pos += steps;
+
+        Ok(())
     }
 
     fn read_qname(&mut self) -> Result<String> {
@@ -127,6 +156,44 @@ impl BytePacketBuffer {
             self.seek(pos)?;
         }
         Ok(out)
+    }
+
+    fn set(&mut self, pos: usize, val: u8) -> Result<()> {
+        self.buf[pos] = val;
+
+        Ok(())
+    }
+
+    fn set_u16(&mut self, pos: usize, val: u16) -> Result<()> {
+        self.set(pos, (val >> 8) as u8)?;
+        self.set(pos + 1, (val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<()> {
+        //                     query name              type   class
+        //        -----------------------------------  -----  -----
+        // HEX    06 67 6f 6f 67 6c 65 03 63 6f 6d 00  00 01  00 01
+        // ASCII     g  o  o  g  l  e     c  o  m
+        // DEC    6                    3           0       1      1
+        // follows the length-label-length-label-...-0 structure
+
+        for label in qname.split('.') {
+            let len = label.len();
+            if len > 63 {
+                bail!("max label length is 63")
+            }
+
+            self.write(len as u8)?;
+            for b in label.as_bytes() {
+                self.write(*b)?;
+            }
+        }
+
+        self.write(0)?;
+
+        Ok(())
     }
 }
 
@@ -236,19 +303,58 @@ impl DnsHeader {
 
         Ok(())
     }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_u16(self.id)?;
+
+        buffer.write(
+            (self.rec_des as u8)
+                | ((self.trunc_msg as u8) << 1)
+                | ((self.auth_ans as u8) << 2)
+                | (self.opcode << 3)
+                | ((self.query_res as u8) << 7) as u8,
+        )?;
+
+        buffer.write((self.rcode as u8) | ((self.z as u8) << 4) | ((self.rec_ava as u8) << 7))?;
+
+        buffer.write_u16(self.qdcount)?;
+        buffer.write_u16(self.anscount)?;
+        buffer.write_u16(self.nscount)?;
+        buffer.write_u16(self.arcount)?;
+
+        Ok(())
+    }
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Hash, Copy)]
 pub enum QueryType {
     UNKNOWN(u16),
-    A,
+    A,     // 1
+    NS,    // 2
+    CNAME, // 5
+    MX,    // 15
+    AAAA,  // 28
 }
-
 impl QueryType {
-    fn from_num(num: u16) -> QueryType {
+    pub fn to_num(&self) -> u16 {
+        match *self {
+            QueryType::UNKNOWN(x) => x,
+            QueryType::A => 1,
+            QueryType::NS => 2,
+            QueryType::CNAME => 6,
+            QueryType::MX => 15,
+            QueryType::AAAA => 28,
+        }
+    }
+
+    pub fn from_num(num: u16) -> QueryType {
         match num {
-            1 => A,
-            _ => UNKNOWN(num),
+            1 => QueryType::A,
+            2 => QueryType::NS,
+            6 => QueryType::CNAME,
+            15 => QueryType::MX,
+            28 => QueryType::AAAA,
+            _ => QueryType::UNKNOWN(num),
         }
     }
 }
@@ -261,10 +367,10 @@ pub struct DnsQuestion {
 }
 
 impl DnsQuestion {
-    pub fn new() -> Self {
+    pub fn new(name: String, qtype: QueryType) -> Self {
         Self {
-            name: String::new(),
-            qtype: QueryType::UNKNOWN(0),
+            name,
+            qtype,
             class: 1,
         }
     }
@@ -273,6 +379,16 @@ impl DnsQuestion {
         self.name = buffer.read_qname()?;
         self.qtype = QueryType::from_num(buffer.read_u16()?);
         self.class = buffer.read_u16()?; // class, usually always 1
+
+        Ok(())
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_qname(&self.name)?;
+
+        let type_num = self.qtype.to_num();
+        buffer.write_u16(type_num)?;
+        buffer.write_u16(1)?; // class
 
         Ok(())
     }
@@ -294,6 +410,35 @@ pub enum DnsRecord {
         len: u16,
         ip: u32,
     },
+    NS {
+        domain: String,
+        class: u16,
+        ttl: u32,
+        len: u16,
+        host: String,
+    },
+    CNAME {
+        domain: String,
+        class: u16,
+        ttl: u32,
+        len: u16,
+        host: String,
+    },
+    MX {
+        domain: String,
+        class: u16,
+        ttl: u32,
+        len: u16,
+        host: String,
+        priority: u16,
+    },
+    AAAA {
+        domain: String,
+        class: u16,
+        ttl: u32,
+        len: u16,
+        ip: u128,
+    },
 }
 
 impl DnsRecord {
@@ -305,6 +450,7 @@ impl DnsRecord {
         let ttl = (buf.read_u16()? << 8) as u32 | buf.read_u16()? as u32;
         let len = buf.read_u16()?;
 
+
         match qtype {
             QueryType::A => Ok(DnsRecord::A {
                 domain,
@@ -313,14 +459,159 @@ impl DnsRecord {
                 len,
                 ip: (buf.read_u16()? as u32) << 16 | buf.read_u16()? as u32,
             }),
-            _ => Ok(DnsRecord::UNKNOWN {
+            QueryType::AAAA => Ok(DnsRecord::AAAA {
                 domain,
-                qtype,
                 class,
                 ttl,
                 len,
+                ip: (buf.read_u16()? as u128) << 16
+                    | (buf.read_u16()? as u128) << 16
+                    | (buf.read_u16()? as u128) << 16
+                    | (buf.read_u16()? as u128) << 16
+                    | (buf.read_u16()? as u128) << 16
+                    | (buf.read_u16()? as u128) << 16
+                    | (buf.read_u16()? as u128) << 16
+                    | buf.read_u16()? as u128,
             }),
+            QueryType::NS => Ok(DnsRecord::NS {
+                domain,
+                class,
+                ttl,
+                len,
+                host: buf.read_qname()?,
+            }),
+            QueryType::CNAME => Ok(DnsRecord::CNAME {
+                domain,
+                class,
+                ttl,
+                len,
+                host: buf.read_qname()?,
+            }),
+            QueryType::MX => {
+                let priority = buf.read_u16()?;
+                let host = buf.read_qname()?;
+
+
+                Ok(DnsRecord::MX {
+                    domain,
+                    class,
+                    priority,
+                    host,
+                    ttl,
+                    len
+                })
+            }
+            _ => {
+                buf.step(len as usize)?;
+                Ok(DnsRecord::UNKNOWN {
+                    domain,
+                    qtype,
+                    class,
+                    ttl,
+                    len,
+                })
+            },
         }
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        let start_pos = buffer.pos();
+
+        match *self {
+            DnsRecord::A {
+                ref domain,
+                ip,
+                ttl,
+                ..
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::A.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(4)?;
+                buffer.write_u32(ip)?;
+            },
+            DnsRecord::NS {
+                ref domain,
+                ref host,
+                ttl,
+                ..
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::NS.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                buffer.write_qname(&host)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            },
+            DnsRecord::CNAME {
+                ref domain,
+                ref host,
+                ttl,
+                ..
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::CNAME.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                buffer.write_qname(host)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            }
+            DnsRecord::MX {
+                ref domain,
+                priority,
+                ref host,
+                ttl,
+                ..
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::MX.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                buffer.write_u16(priority)?;
+                buffer.write_qname(host)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            }
+            DnsRecord::AAAA {
+                ref domain,
+                ref ip,
+                ttl,
+                ..
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::AAAA.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(16)?;
+
+                for i in 0..4 {
+                    buffer.write_u32((ip >> (i * 32)) as u32)?;
+                }
+            }
+            DnsRecord::UNKNOWN { .. } => {
+                println!("Skipping record: {:?}", self);
+            }
+        }
+
+        Ok(buffer.pos() - start_pos)
     }
 }
 
@@ -334,7 +625,7 @@ pub struct DnsPacket {
 }
 
 impl DnsPacket {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             header: DnsHeader::new(),
             questions: vec![],
@@ -349,7 +640,7 @@ impl DnsPacket {
         res.header.read(buf)?;
 
         for _ in 0..res.header.qdcount {
-            let mut qn = DnsQuestion::new();
+            let mut qn = DnsQuestion::new("".to_string(), QueryType::UNKNOWN(0));
             qn.read(buf)?;
             res.questions.push(qn)
         }
@@ -358,12 +649,78 @@ impl DnsPacket {
             res.answers.push(DnsRecord::from(buf)?)
         }
         for _ in 0..res.header.nscount {
-            res.answers.push(DnsRecord::from(buf)?)
+            res.authorities.push(DnsRecord::from(buf)?)
         }
         for _ in 0..res.header.arcount {
-            res.answers.push(DnsRecord::from(buf)?)
+            res.additional.push(DnsRecord::from(buf)?)
         }
 
         Ok(res)
     }
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.header.qdcount = self.questions.len() as u16;
+        self.header.anscount = self.answers.len() as u16;
+        self.header.nscount = self.authorities.len() as u16;
+        self.header.arcount = self.additional.len() as u16;
+
+        self.header.write(buffer)?;
+
+        for question in &self.questions {
+            question.write(buffer)?;
+        }
+        for rec in &self.answers {
+            rec.write(buffer)?;
+        }
+        for rec in &self.authorities {
+            rec.write(buffer)?;
+        }
+        for rec in &self.additional {
+            rec.write(buffer)?;
+        }
+
+        Ok(())
+    }
+
+
+    pub fn get_random_a(&self) -> Option<u32> {
+        self.answers
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::A { ip, .. } => Some(*ip),
+                _ => None,
+            })
+            .next()
+    }
+
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.authorities
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::NS { domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
+            })
+            .filter(move |(domain, _)| qname.ends_with(*domain))
+    }
+
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<u32> {
+        self.get_ns(qname)
+            .flat_map(|(_, host)| {
+                self.additional
+                    .iter()
+                    .filter_map(move |record| match record {
+                        DnsRecord::A { domain, ip, .. } if domain == host => Some(ip),
+                        _ => None,
+                    })
+            })
+            .map(|addr| *addr)
+            .next()
+    }
+
+    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        self.get_ns(qname)
+            .map(|(_, host)| host)
+            .next()
+    }
+
+
 }
